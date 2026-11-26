@@ -11,42 +11,49 @@ import transactionRoutes from "./routes/transactionRoutes.js";
 
 dotenv.config();
 
-// Security headers with Helmet
 const app = express();
 
-// Rate limiter - limit to 100 requests per minute
+// Rate limiter
 const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
+  windowMs: 60 * 1000,
   max: 100,
-  message: { success: false, message: "Too many requests, please try again later." },
+  message: {
+    success: false,
+    message: "Too many requests, please try again later.",
+  },
 });
 
-// CORS configuration based on environment
-const allowedOrigins = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(",")
-  : []; // Empty by default for security
+// CORS configuration
+const allowedOrigins = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl requests)
     if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(null, true); // In development, allow all; in production, restrict
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
     }
+
+    if (process.env.NODE_ENV !== "production") {
+      return callback(null, true);
+    }
+
+    return callback(new Error("Not allowed by CORS"));
   },
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
 };
 
-// Apply security middleware in correct order
-app.use(helmet()); // 1. Security headers first
-app.use(limiter); // 2. Rate limiter second
-app.use(cors(corsOptions)); // 3. CORS third
-app.use(express.json({ limit: "10kb" })); // 4. Body size limit fourth
+// Security middleware
+app.use(helmet());
+app.use(limiter);
+app.use(cors(corsOptions));
+app.use(express.json({ limit: "10kb" }));
 
-// Health check route (before routes to ensure it works)
+// Health check
 app.get("/health", (_req, res) => {
   res.status(200).json({
     success: true,
@@ -69,7 +76,7 @@ app.get("/", (_req, res) => {
   });
 });
 
-// Gnani Text-to-Speech (must come before 404 handler)
+// Gnani Text-to-Speech
 app.post("/api/voice/speak", async (req, res, next) => {
   try {
     const { text } = req.body;
@@ -115,6 +122,7 @@ app.post("/api/voice/speak", async (req, res, next) => {
 
     if (!response.ok) {
       const message = await response.text();
+
       return res.status(response.status).json({
         success: false,
         message: message || "Gnani speech generation failed.",
@@ -128,12 +136,11 @@ app.post("/api/voice/speak", async (req, res, next) => {
   }
 });
 
-// Centralized error handling - must be after all other middleware
+// Centralized error handling
 app.use((err, _req, res, _next) => {
   console.error("ERROR:", err.message);
   console.error("STACK:", err.stack);
 
-  // Mongoose validation error
   if (err.name === "ValidationError") {
     return res.status(400).json({
       success: false,
@@ -142,7 +149,6 @@ app.use((err, _req, res, _next) => {
     });
   }
 
-  // Mongoose duplicate key error
   if (err.code === 11000) {
     return res.status(409).json({
       success: false,
@@ -150,23 +156,27 @@ app.use((err, _req, res, _next) => {
     });
   }
 
-  // Default error response
   res.status(err.status || 500).json({
     success: false,
     message: err.message || "Internal server error",
   });
 });
 
+// Start server
 const startServer = async () => {
   try {
     await connectDB();
+
     console.log("MongoDB connected successfully");
 
     const PORT = process.env.PORT || 5000;
     const server = createServer(app);
 
-    const voiceWss = new WebSocketServer({ noServer: true });
+    const voiceWss = new WebSocketServer({
+      noServer: true,
+    });
 
+    // WebSocket upgrade handling
     server.on("upgrade", (request, socket, head) => {
       if (request.url !== "/api/voice/stream") {
         socket.destroy();
@@ -185,143 +195,231 @@ const startServer = async () => {
 
     // Gnani STT WebSocket proxy
     voiceWss.on("connection", (ws) => {
-      // @ts-ignore: audioFrameCount used for logging only; see ws.on("message") counter log
       let gnaniWs = null;
       let audioFrameCount = 0;
+      let gnaniConnected = false;
+      let stopped = false;
 
       try {
-        gnaniWs = new WebSocket("wss://api.vachana.ai/stt/v3/stream", {
-          headers: {
-            "X-API-Key-ID": process.env.GNANI_API_KEY,
-            "language_code": "hi-IN",
-            "x-sample-rate": "16000",
-          },
-        });
+        gnaniWs = new WebSocket(
+          "wss://api.vachana.ai/stt/v3/stream",
+          {
+            headers: {
+              "X-API-Key-ID": process.env.GNANI_API_KEY,
+              language_code: "hi-IN",
+              "x-sample-rate": "16000",
+            },
+          }
+        );
       } catch (err) {
-        console.error("Failed to create Gnani WebSocket:", err.message);
+        console.error(
+          "Failed to create Gnani WebSocket:",
+          err.message
+        );
+
         ws.close();
         return;
       }
 
+      // Gnani WebSocket opened
+      // Wait for actual STT connection confirmation
       gnaniWs.on("open", () => {
-      console.log("Gnani WS open");
-      // Tell the client the Gnani STT connection is ready
-      ws.send(JSON.stringify({ type: "ready" }));
-    });
-
-      gnaniWs.on("unexpected-response", (res) => {
-        console.log("Gnani rejected connection, HTTP status:", res.statusCode);
-        let body = "";
-        res.on("data", (c) => (body += c));
-        res.on("end", () => console.log("Gnani response body:", body));
+        console.log(
+          "Gnani WebSocket opened; waiting for STT connection"
+        );
       });
 
-      gnaniWs.on("error", (err) => console.log("Gnani WS error:", err.message));
+      // Handle rejected Gnani connection
+      gnaniWs.on("unexpected-response", (res) => {
+        console.log(
+          "Gnani rejected connection, HTTP status:",
+          res.statusCode
+        );
 
-      gnaniWs.on("close", (code, reason) =>
-        console.log("Gnani WS closed:", code, reason.toString())
-      );
+        let body = "";
 
-      let gnamiConnected = false;
+        res.on("data", (chunk) => {
+          body += chunk;
+        });
 
+        res.on("end", () => {
+          console.log("Gnani response body:", body);
+        });
+      });
+
+      // Handle Gnani messages
       gnaniWs.on("message", (data) => {
         const raw = data.toString();
+
         console.log("Gnani message:", raw.slice(0, 300));
+
         try {
           const message = JSON.parse(raw);
 
+          // Actual Gnani connection confirmation
           if (message.type === "connected") {
-            // Gnami STT v3 connection established, now safe to send audio
-            gnamiConnected = true;
-            console.log("Gnami STT connected - audio forwarding enabled");
+            gnaniConnected = true;
+
+            console.log(
+              "Gnani STT connected - audio forwarding enabled"
+            );
+
+            // Notify frontend only after Gnani confirms connection
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "ready",
+                })
+              );
+            }
+
             return;
           }
 
-          if (!gnamiConnected) {
-            // Waiting for initial connection; ignore other messages until connected
+          // Ignore messages until connected
+          if (!gnaniConnected) {
             return;
           }
 
+          // Transcript response
           if (message.type === "transcript" && message.text) {
-            // Send final/partial transcript to client
-            ws.send(
-              JSON.stringify({
-                type: "transcript",
-                text: message.text,
-              })
-            );
-          } else if (message.type === "error") {
-            ws.send(
-              JSON.stringify({
-                type: "error",
-                message: message.message || "Gnani STT error.",
-              })
-            );
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "transcript",
+                  text: message.text,
+                })
+              );
+            }
+          }
+
+          // STT error
+          else if (message.type === "error") {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: message.message || "Gnani STT error.",
+                })
+              );
+            }
+
             stop();
-          } else if (message.type === "sessionbias") {
-            // Keyterms/bias configuration acknowledgment
+          }
+
+          // Session bias acknowledgment
+          else if (message.type === "sessionbias") {
+            // No action required
           }
         } catch (err) {
-          console.error("Error parsing Gnani message:", err.message);
+          console.error(
+            "Error parsing Gnani message:",
+            err.message
+          );
         }
       });
 
+      // Handle Gnani WebSocket errors
       gnaniWs.on("error", (err) => {
         console.error("Gnani WebSocket error:", err.message);
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            message: "Gnani STT connection error.",
-          })
-        );
+
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message: "Gnani STT connection error.",
+            })
+          );
+        }
+
         stop();
       });
 
-      gnaniWs.on("close", () => {
-        console.log("Gnani STT connection closed");
+      // Handle Gnani WebSocket close
+      gnaniWs.on("close", (code, reason) => {
+        console.log(
+          "Gnani STT connection closed:",
+          code,
+          reason.toString()
+        );
+
         stop();
       });
 
       // Forward client audio to Gnani
       ws.on("message", (data) => {
-        if (gnaniWs.readyState === WebSocket.OPEN) {
-          // Gnani expects raw PCM audio sent as binary frames
-          if (Buffer.isBuffer(data) || data instanceof Uint8Array || data instanceof ArrayBuffer) {
-            audioFrameCount++;
-            if (audioFrameCount % 100 === 0) {
-              console.log(`Forwarded ${audioFrameCount} audio frames to Gnani STT`);
+        // Do not forward audio until Gnani confirms connection
+        if (
+          !gnaniConnected ||
+          !gnaniWs ||
+          gnaniWs.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+
+        // Binary PCM audio frames
+        if (
+          Buffer.isBuffer(data) ||
+          data instanceof Uint8Array ||
+          data instanceof ArrayBuffer
+        ) {
+          audioFrameCount++;
+
+          if (audioFrameCount % 100 === 0) {
+            console.log(
+              `Forwarded ${audioFrameCount} audio frames to Gnani STT`
+            );
+          }
+
+          gnaniWs.send(data);
+        }
+
+        // Control messages
+        else if (typeof data === "string") {
+          try {
+            const msg = JSON.parse(data);
+
+            if (msg.type && msg.type !== "audio") {
+              gnaniWs.send(data);
             }
-            gnaniWs.send(data);
-          } else if (typeof data === "string") {
-            // Maybe JSON message, forward as-is or parse
-            try {
-              const msg = JSON.parse(data);
-              if (msg.type && msg.type !== "audio") {
-                // It's a control message, forward to Gnani
-                gnaniWs.send(data);
-              }
-            } catch {
-              // Not JSON, ignore or handle as needed
-            }
+          } catch {
+            // Ignore invalid JSON
           }
         }
       });
 
+      // Client disconnected
       ws.on("close", stop);
 
+      // Stop both connections safely
       function stop() {
-        if (gnaniWs && gnaniWs.readyState === WebSocket.OPEN) {
+        if (stopped) return;
+
+        stopped = true;
+        gnaniConnected = false;
+
+        if (
+          gnaniWs &&
+          gnaniWs.readyState !== WebSocket.CLOSED
+        ) {
           gnaniWs.close();
-          gnaniWs = null;
         }
-        ws.close();
+
+        if (ws.readyState !== WebSocket.CLOSED) {
+          ws.close();
+        }
       }
     });
 
+    // Start HTTP server
     server.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
-      console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
-      console.log(`CORS origin: ${process.env.CORS_ORIGIN || "development (all origins)"}`);
+      console.log(
+        `Environment: ${process.env.NODE_ENV || "development"}`
+      );
+      console.log(
+        `CORS origin: ${process.env.CORS_ORIGIN || "development (all origins)"}`
+      );
     });
   } catch (error) {
     console.error("Failed to start server:", error.message);
